@@ -121,12 +121,16 @@ func mix(_ a: NSColor, _ b: NSColor, _ t: CGFloat) -> NSColor {
 
 // NSSwitch loses its accent color inside menus of an inactive app, so draw our own.
 final class Pill: NSView {
-    var onClick: (() -> Void)?
     private var progress: CGFloat = 0
     private var timer: Timer?
     var isOn = false {
         didSet {
             guard isOn != oldValue else { return }
+            if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                progress = isOn ? 1 : 0
+                needsDisplay = true
+                return
+            }
             // .common mode keeps the animation running while the menu is tracking events
             timer?.invalidate()
             let t = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] t in
@@ -175,7 +179,65 @@ final class Pill: NSView {
         }
     }
 
+}
+
+// The whole menu row is the control: clickable anywhere, and exposed to VoiceOver as one checkbox
+final class ToggleRow: NSView {
+    let pill: Pill
+    var onClick: (() -> Void)?
+
+    init(pill: Pill, label: String) {
+        self.pill = pill
+        super.init(frame: NSRect(x: 0, y: 0, width: 240, height: 32))
+        autoresizingMask = .width
+        let text = NSTextField(labelWithString: label)
+        text.frame = NSRect(x: 14, y: 7, width: 120, height: 18)
+        pill.frame.origin = NSPoint(x: frame.width - pill.frame.width - 14, y: (frame.height - pill.frame.height) / 2)
+        pill.autoresizingMask = .minXMargin
+        addSubview(text)
+        addSubview(pill)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { bounds.contains(convert(point, from: superview)) ? self : nil }
     override func mouseDown(with e: NSEvent) { onClick?() }
+
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .checkBox }
+    override func accessibilityLabel() -> String? { "Prevent Sleep" }
+    override func accessibilityValue() -> Any? { pill.isOn ? 1 : 0 }
+    override func accessibilityPerformPress() -> Bool {
+        onClick?()
+        return true
+    }
+}
+
+final class SettingsWindow: NSWindow {
+    override func cancelOperation(_ sender: Any?) { performClose(sender) }
+}
+
+// Accessory apps have no menu bar, but key equivalents such as Cmd+C or Cmd+W are still routed through the main menu
+func installMainMenu() {
+    let main = NSMenu()
+    func add(_ title: String, _ items: [NSMenuItem]) {
+        let top = NSMenuItem()
+        let sub = NSMenu(title: title)
+        items.forEach(sub.addItem)
+        top.submenu = sub
+        main.addItem(top)
+    }
+    func item(_ title: String, _ action: Selector, _ key: String, shift: Bool = false) -> NSMenuItem {
+        let i = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        if shift { i.keyEquivalentModifierMask = [.command, .shift] }
+        return i
+    }
+    add("Dont Sleep", [item("Quit Dont Sleep", #selector(NSApplication.terminate(_:)), "q")])
+    add("Edit", [item("Undo", Selector(("undo:")), "z"), item("Redo", Selector(("redo:")), "z", shift: true), .separator(),
+                 item("Cut", #selector(NSText.cut(_:)), "x"), item("Copy", #selector(NSText.copy(_:)), "c"),
+                 item("Paste", #selector(NSText.paste(_:)), "v"), item("Select All", #selector(NSText.selectAll(_:)), "a")])
+    add("Window", [item("Close", #selector(NSWindow.performClose(_:)), "w")])
+    NSApp.mainMenu = main
 }
 
 let autoOffChoices: [(String, Int)] = [("Never", 0), ("15 minutes", 900), ("30 minutes", 1800), ("1 hour", 3600), ("2 hours", 7200), ("4 hours", 14400), ("8 hours", 28800)]
@@ -184,6 +246,7 @@ let autoOffUnits: [(String, Int)] = [("Seconds", 1), ("Minutes", 60), ("Hours", 
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let toggle = Pill(frame: NSRect(x: 0, y: 0, width: 54, height: 28))
+    lazy var row = ToggleRow(pill: toggle, label: "Prevent Sleep")
     let defaults = UserDefaults.standard
     var autoOffTimer: Timer?
     var tickTimer: Timer?
@@ -205,15 +268,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         defaults.removeObject(forKey: "autoOffMinutes")
         UNUserNotificationCenter.current().delegate = self
 
-        let label = NSTextField(labelWithString: "Prevent Sleep")
-        toggle.onClick = { [unowned self] in toggled() }
-        let row = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 32))
-        label.frame = NSRect(x: 14, y: 7, width: 120, height: 18)
-        toggle.frame.origin = NSPoint(x: 240 - toggle.frame.width - 14, y: (32 - toggle.frame.height) / 2)
-        toggle.autoresizingMask = .minXMargin
-        row.autoresizingMask = .width
-        row.addSubview(label)
-        row.addSubview(toggle)
+        installMainMenu()
+        row.onClick = { [unowned self] in toggled() }
 
         let menu = NSMenu()
         menu.delegate = self
@@ -235,7 +291,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         menu.addItem(.separator())
         menu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",").target = self
         menu.addItem(withTitle: "Uninstall…", action: #selector(uninstall), keyEquivalent: "").target = self
-        menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(withTitle: "Quit Dont Sleep", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
 
         // pkill and similar send SIGTERM, which would otherwise skip applicationWillTerminate
@@ -281,7 +337,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         guard let on = sleepDisabled() else { return }
         toggle.isOn = on
         if on { if watchdog?.isRunning != true { armWatchdog() } } else { disarm() }
-        item.button?.image = NSImage(systemSymbolName: on ? "cup.and.saucer.fill" : "moon.zzz", accessibilityDescription: nil)
+        let state = on ? "Sleep prevention is on" : "Sleep prevention is off"
+        item.button?.image = NSImage(systemSymbolName: on ? "cup.and.saucer.fill" : "moon.zzz", accessibilityDescription: state)
+        item.button?.toolTip = "Dont Sleep: " + state.lowercased()
+        item.button?.setAccessibilityLabel("Dont Sleep")
+        item.button?.setAccessibilityValue(state)
+        NSAccessibility.post(element: row, notification: .valueChanged)
     }
 
     func toggled() {
@@ -646,9 +707,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     @objc func addFive() { keepAwake(seconds: 300, extend: true) }
 
     @objc func openSettings() {
-        let view = SettingsView(onAutoOffChange: { [weak self] in if self?.manualDeadline != true { self?.armAutoOff() } }, onDisplayChange: { [weak self] in self?.updateCountdown() })
+        // center() uses NSScreen.main, which can be a different display than the one the user is looking at
+        let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main
+        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        // Leave room for the title bar so the window always fits and the form scrolls instead of clipping
+        let view = SettingsView(maxHeight: visible.height - 56,
+                                onAutoOffChange: { [weak self] in if self?.manualDeadline != true { self?.armAutoOff() } },
+                                onDisplayChange: { [weak self] in self?.updateCountdown() })
         if settingsWindow == nil {
-            let w = NSWindow(contentRect: .zero, styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
+            let w = SettingsWindow(contentRect: .zero, styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
             w.title = "Dont Sleep Settings"
             w.titlebarAppearsTransparent = true
             w.isReleasedWhenClosed = false
@@ -658,10 +725,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         }
         // Fresh view each time so the login item state is re-read
         settingsWindow?.contentViewController = NSHostingController(rootView: view)
-        // center() uses NSScreen.main, which can be a different display than the one the user is looking at
-        if let w = settingsWindow, let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main {
-            let f = screen.visibleFrame
-            w.setFrameOrigin(NSPoint(x: f.midX - w.frame.width / 2, y: f.midY - w.frame.height / 2))
+        if let w = settingsWindow {
+            let x = min(max(visible.midX - w.frame.width / 2, visible.minX), visible.maxX - w.frame.width)
+            let y = min(max(visible.midY - w.frame.height / 2, visible.minY), visible.maxY - w.frame.height)
+            w.setFrameOrigin(NSPoint(x: x, y: y))
         }
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
@@ -680,6 +747,7 @@ struct SettingsView: View {
     @AppStorage("lowBatteryPercent") private var lowBatteryPercent = 20
     @State private var login = SMAppService.mainApp.status == .enabled
     @State private var custom = !autoOffChoices.contains { $0.1 == UserDefaults.standard.integer(forKey: "autoOffSeconds") }
+    let maxHeight: CGFloat
     let onAutoOffChange: () -> Void
     let onDisplayChange: () -> Void
 
@@ -718,6 +786,8 @@ struct SettingsView: View {
             seconds = amount * u
         })
     }
+
+    private var desiredHeight: CGFloat { (custom ? 110 : 0) + (lowBatteryOff ? 44 : 0) + 630 }
 
     var body: some View {
         Form {
@@ -762,8 +832,8 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .scrollDisabled(true)
-        .frame(width: 400, height: (custom ? 110 : 0) + (lowBatteryOff ? 44 : 0) + 630)
+        .scrollDisabled(desiredHeight <= maxHeight)
+        .frame(width: 400, height: min(desiredHeight, maxHeight))
         .onChange(of: seconds) { onAutoOffChange() }
         .onChange(of: showCountdown) { onDisplayChange() }
     }
