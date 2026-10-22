@@ -5,25 +5,35 @@ import IOKit.ps
 import SwiftUI
 import UserNotifications
 
-func sleepDisabled() -> Bool {
+// Waits on a semaphore instead of waitUntilExit, which would spin the run loop and let other handlers run mid-toggle.
+// Returns nil if the process cannot start or does not finish within the timeout.
+func runProcess(_ path: String, _ args: [String], timeout: TimeInterval = 6) -> (status: Int32, output: String)? {
     let p = Process()
     let pipe = Pipe()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-    p.arguments = ["-g"]
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
     p.standardOutput = pipe
-    try? p.run()
-    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    return out.split(separator: "\n").contains { $0.contains("SleepDisabled") && $0.split(whereSeparator: \.isWhitespace).last == "1" }
+    p.standardError = FileHandle.nullDevice
+    let done = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in done.signal() }
+    do { try p.run() } catch { return nil }
+    // Our own copy of the write end must be closed, or the read below never reaches EOF
+    try? pipe.fileHandleForWriting.close()
+    guard done.wait(timeout: .now() + timeout) == .success else {
+        p.terminate()
+        return nil
+    }
+    return (p.terminationStatus, String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "")
+}
+
+// nil means the state could not be read, which must not be confused with "sleep is allowed"
+func sleepDisabled() -> Bool? {
+    guard let r = runProcess("/usr/bin/pmset", ["-g"]), r.status == 0 else { return nil }
+    return r.output.split(separator: "\n").contains { $0.contains("SleepDisabled") && $0.split(whereSeparator: \.isWhitespace).last == "1" }
 }
 
 func run(_ path: String, _ args: [String]) -> Bool {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: path)
-    p.arguments = args
-    p.standardError = FileHandle.nullDevice
-    guard (try? p.run()) != nil else { return false }
-    p.waitUntilExit()
-    return p.terminationStatus == 0
+    runProcess(path, args)?.status == 0
 }
 
 // Relies on a sudoers rule: the osascript admin dialog does not accept keyboard input for an ad-hoc signed app
@@ -61,6 +71,7 @@ func powerInfo() -> (onBattery: Bool, percent: Int)? {
     return nil
 }
 
+let maxAutoOffSeconds = 8_640_000_000
 let sudoersRulePath = "/etc/sudoers.d/dont-sleep"
 let hotkeyNames = ["toggle", "add5"]
 let hotkeyDefaults: [String: (key: Int, label: String)] = ["toggle": (1, "⌃⌥⌘S"), "add5": (23, "⌃⌥⌘5")]
@@ -84,11 +95,13 @@ func registerHotkeys() {
     hotkeyRefs.forEach { UnregisterEventHotKey($0) }
     hotkeyRefs = []
     for (i, name) in hotkeyNames.enumerated() {
+        // Values come from user defaults, so anything outside the valid ranges is ignored instead of trapping
         let key = UserDefaults.standard.integer(forKey: "hk.\(name).key")
-        guard key >= 0 else { continue }
+        let mods = UserDefaults.standard.integer(forKey: "hk.\(name).mods") & (cmdKey | optionKey | controlKey | shiftKey)
+        guard (0...127).contains(key), mods & (cmdKey | optionKey | controlKey) != 0 else { continue }
         var ref: EventHotKeyRef?
         let id = EventHotKeyID(signature: OSType(0x44534C50), id: UInt32(i + 1))
-        if RegisterEventHotKey(UInt32(key), UInt32(UserDefaults.standard.integer(forKey: "hk.\(name).mods")), id, GetApplicationEventTarget(), 0, &ref) == noErr, let ref {
+        if RegisterEventHotKey(UInt32(key), UInt32(mods), id, GetApplicationEventTarget(), 0, &ref) == noErr, let ref {
             hotkeyRefs.append(ref)
         }
     }
@@ -175,6 +188,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     var autoOffTimer: Timer?
     var tickTimer: Timer?
     var deadline: Date?
+    // A deadline picked from the menu must survive later edits of the auto-off preference
+    var manualDeadline = false
+    var watchdog: Process?
+    var sudoWaitTimer: Timer?
     var termSource: DispatchSourceSignal?
     var settingsWindow: NSWindow?
     var wasOnBattery: Bool?
@@ -229,7 +246,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         termSource = term
 
         // disablesleep survives reboots, so the safe default is restoring it
-        if defaults.bool(forKey: "resetOnLaunch") && sleepDisabled() { setSleepDisabled(false) }
+        if defaults.bool(forKey: "resetOnLaunch") && sleepDisabled() == true { setSleepDisabled(false) }
         refresh()
         startPowerMonitor()
 
@@ -237,6 +254,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         installHotkeyHandler()
         registerHotkeys()
         NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { _ in registerHotkeys() }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [unowned self] _ in checkDeadline() }
+        NotificationCenter.default.addObserver(forName: .NSSystemClockDidChange, object: nil, queue: .main) { [unowned self] _ in checkDeadline() }
     }
 
     func userNotificationCenter(_ c: UNUserNotificationCenter, willPresent n: UNNotification, withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
@@ -246,7 +265,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     func menuWillOpen(_ menu: NSMenu) { refresh() }
 
     func applicationWillTerminate(_ n: Notification) {
-        if defaults.bool(forKey: "restoreOnQuit") && sleepDisabled() { setSleepDisabled(false) }
+        // Restore also when the state is unknown: setting 0 is harmless if sleep was already allowed
+        if defaults.bool(forKey: "restoreOnQuit") && sleepDisabled() != false { setSleepDisabled(false) }
+        stopWatchdog()
     }
 
     // Relaunching the app (Launchpad, Spotlight) opens Settings, handy when the icon is hidden by the notch
@@ -256,21 +277,40 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     }
 
     func refresh() {
-        let on = sleepDisabled()
+        // An unreadable state keeps what is shown (and the timers) instead of pretending sleep is allowed
+        guard let on = sleepDisabled() else { return }
         toggle.isOn = on
-        if !on { disarm() }
+        if on { if watchdog?.isRunning != true { armWatchdog() } } else { disarm() }
         item.button?.image = NSImage(systemSymbolName: on ? "cup.and.saucer.fill" : "moon.zzz", accessibilityDescription: nil)
     }
 
     func toggled() {
         let on = !toggle.isOn
-        guard setSleepDisabled(on) else {
-            item.menu?.cancelTracking()
-            DispatchQueue.main.async { self.showSetupAlert { self.refresh(); self.toggled() } }
-            return
-        }
+        guard setSleepDisabled(on) else { return reportChangeFailure { self.setPower(on) } }
         refresh()
         if on { armAutoOff() }
+    }
+
+    // Idempotent on purpose: a delayed setup retry must never flip a state the user has changed meanwhile
+    func setPower(_ on: Bool) {
+        refresh()
+        if toggle.isOn != on { toggled() }
+    }
+
+    // The setup alert is for a missing rule only; any other failure just says so
+    func reportChangeFailure(retry: @escaping () -> Void) {
+        item.menu?.cancelTracking()
+        DispatchQueue.main.async {
+            if sudoRuleWorks() {
+                let a = NSAlert()
+                a.messageText = "Could not change the sleep setting"
+                a.informativeText = "macOS did not accept the change. Try again in a moment."
+                NSApp.activate(ignoringOtherApps: true)
+                a.runModal()
+            } else {
+                self.showSetupAlert(retry: retry)
+            }
+        }
     }
 
     // Runs a command as root through the standard macOS admin prompt; completion gets nil when the user dismissed the prompt
@@ -354,7 +394,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
                     switch result {
                     case true?:
                         // A silent mismatch (rule installed but not effective) must not look like success
-                        if sudoRuleWorks() { retry() } else { self.showSetupAlert(retry: retry, nativeFailed: true) }
+                        if sudoRuleWorks() { self.sudoWaitTimer?.invalidate(); self.sudoWaitTimer = nil; retry() } else { self.showSetupAlert(retry: retry, nativeFailed: true) }
                     case false?: self.showSetupAlert(retry: retry, nativeFailed: true)
                     case nil: break
                     }
@@ -383,8 +423,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-        // Must happen while the sudoers rule still exists
-        setSleepDisabled(false)
+        // Must happen while the sudoers rule still exists, and must not be skipped silently
+        if !setSleepDisabled(false) && sleepDisabled() != false {
+            let a = NSAlert()
+            a.messageText = "Could not restore normal sleep"
+            a.informativeText = "Uninstall was cancelled so the Mac is not left unable to sleep. Turn sleep prevention off first, then try again."
+            a.runModal()
+            return
+        }
         guard FileManager.default.fileExists(atPath: sudoersRulePath) else { return finishUninstall() }
         runAsAdmin("/bin/rm -f \(sudoersRulePath)") { [self] result in
             switch result {
@@ -403,6 +449,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
 
     func finishUninstall() {
         disarm()
+        stopWatchdog()
         hotkeyRefs.forEach { UnregisterEventHotKey($0) }
         hotkeyRefs = []
         try? SMAppService.mainApp.unregister()
@@ -433,30 +480,46 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         }
     }
 
+    // One poller at a time, capped at two minutes: stale ones must not fire a late retry
     func waitForSudoRule(_ then: @escaping () -> Void) {
+        sudoWaitTimer?.invalidate()
         var tries = 0
-        let t = Timer(timeInterval: 1, repeats: true) { t in
+        let t = Timer(timeInterval: 2, repeats: true) { [weak self] t in
             tries += 1
-            if run("/usr/bin/sudo", ["-n", "-l", "/usr/bin/pmset", "-a", "disablesleep", "0"]) {
+            if sudoRuleWorks() {
                 t.invalidate()
+                self?.sudoWaitTimer = nil
                 then()
-            } else if tries >= 600 {
+            } else if tries >= 60 {
                 t.invalidate()
+                self?.sudoWaitTimer = nil
             }
         }
+        t.tolerance = 0.5
         RunLoop.main.add(t, forMode: .common)
+        sudoWaitTimer = t
     }
 
     func autoTurnOff(_ reason: String) {
-        setSleepDisabled(false)
+        let ok = setSleepDisabled(false)
         refresh()
-        guard defaults.bool(forKey: "notifyAutoOff") else { return }
+        if !ok && sleepDisabled() != false {
+            // Never claim success: the laptop is still awake. Stop the countdown, which would sit at 0:00 forever.
+            disarm()
+            notify("Could not restore normal sleep. Open Dont Sleep and turn it off.", force: true)
+            return
+        }
+        notify("Sleep restored: \(reason)")
+    }
+
+    func notify(_ body: String, force: Bool = false) {
+        guard force || defaults.bool(forKey: "notifyAutoOff") else { return }
         let c = UNUserNotificationCenter.current()
         c.requestAuthorization(options: [.alert, .sound]) { ok, _ in
             guard ok else { return }
             let content = UNMutableNotificationContent()
             content.title = "Dont Sleep"
-            content.body = "Sleep restored: \(reason)"
+            content.body = body
             c.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
         }
     }
@@ -474,10 +537,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         guard let (onBattery, percent) = powerInfo() else { return }
         let justUnplugged = onBattery && wasOnBattery == false
         wasOnBattery = onBattery
-        guard onBattery, sleepDisabled() else { return }
+        guard onBattery, sleepDisabled() == true else { return }
         if justUnplugged && defaults.bool(forKey: "offWhenUnplugged") {
             autoTurnOff("power adapter unplugged")
-        } else if defaults.bool(forKey: "lowBatteryOff") && percent <= defaults.integer(forKey: "lowBatteryPercent") {
+        } else if defaults.bool(forKey: "lowBatteryOff") && percent <= min(max(defaults.integer(forKey: "lowBatteryPercent"), 5), 90) {
             autoTurnOff("battery at \(percent)%")
         }
     }
@@ -485,7 +548,30 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     func disarm() {
         autoOffTimer?.invalidate()
         deadline = nil
+        manualDeadline = false
         updateCountdown()
+        stopWatchdog()
+    }
+
+    func stopWatchdog() {
+        watchdog?.terminate()
+        watchdog = nil
+    }
+
+    // Detached helper that restores normal sleep if this process dies (crash, kill -9) or hangs past the deadline,
+    // so a laptop is never left awake in a bag. It compares the parent start time to survive pid reuse.
+    func armWatchdog() {
+        stopWatchdog()
+        guard defaults.bool(forKey: "restoreOnQuit"), toggle.isOn else { return }
+        let until = deadline.map { Int($0.timeIntervalSince1970) + 20 } ?? 9_999_999_999
+        let script = "PATH=/usr/bin:/bin:/usr/sbin:/sbin; s=$(ps -p \"$1\" -o lstart= 2>/dev/null); while [ -n \"$s\" ] && [ \"$(ps -p \"$1\" -o lstart= 2>/dev/null)\" = \"$s\" ] && [ \"$(date +%s)\" -lt \"$2\" ]; do sleep 10; done; sudo -n /usr/bin/pmset -a disablesleep 0"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", script, "sh", String(getpid()), String(until)]
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        if (try? p.run()) != nil { watchdog = p }
     }
 
     func updateCountdown() {
@@ -504,6 +590,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             let delay = r > 3600 ? max(0.5, t.truncatingRemainder(dividingBy: 60) + 0.05) : 1
             // .common mode so the countdown keeps moving while the menu is open
             let timer = Timer(timeInterval: delay, repeats: false) { _ in tick() }
+            timer.tolerance = r > 3600 ? 1 : 0.1
             RunLoop.main.add(timer, forMode: .common)
             tickTimer = timer
         }
@@ -520,13 +607,22 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         let t = Timer(timeInterval: max(0, date.timeIntervalSinceNow), repeats: false) { [weak self] _ in
             self?.autoTurnOff("auto-off timer elapsed")
         }
+        t.tolerance = 1
         RunLoop.main.add(t, forMode: .common)
         autoOffTimer = t
+        armWatchdog()
+    }
+
+    // The timer follows a clock that stops while the Mac sleeps, and the user can change the wall clock
+    func checkDeadline() {
+        refresh()
+        guard let d = deadline else { return }
+        if d <= Date() { autoTurnOff("auto-off timer elapsed") } else { schedule(until: d) }
     }
 
     func armAutoOff() {
         disarm()
-        let seconds = defaults.integer(forKey: "autoOffSeconds")
+        let seconds = min(max(defaults.integer(forKey: "autoOffSeconds"), 0), maxAutoOffSeconds)
         guard seconds > 0, toggle.isOn else { return }
         schedule(until: Date().addingTimeInterval(TimeInterval(seconds)))
     }
@@ -535,13 +631,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     func keepAwake(seconds: Int, extend: Bool) {
         refresh()
         if !toggle.isOn {
-            guard setSleepDisabled(true) else {
-                DispatchQueue.main.async { self.showSetupAlert { self.keepAwake(seconds: seconds, extend: extend) } }
-                return
-            }
+            guard setSleepDisabled(true) else { return reportChangeFailure { self.keepAwake(seconds: seconds, extend: extend) } }
             refresh()
         }
-        schedule(until: (extend ? deadline ?? Date() : Date()).addingTimeInterval(TimeInterval(seconds)))
+        // A deadline already in the past (Mac slept through it) must not be extended from the past
+        let base = extend ? max(deadline ?? Date(), Date()) : Date()
+        manualDeadline = true
+        schedule(until: base.addingTimeInterval(TimeInterval(seconds)))
     }
 
     @objc func keepOneHour() { keepAwake(seconds: 3600, extend: false) }
@@ -550,7 +646,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     @objc func addFive() { keepAwake(seconds: 300, extend: true) }
 
     @objc func openSettings() {
-        let view = SettingsView(onAutoOffChange: { [weak self] in self?.armAutoOff() }, onDisplayChange: { [weak self] in self?.updateCountdown() })
+        let view = SettingsView(onAutoOffChange: { [weak self] in if self?.manualDeadline != true { self?.armAutoOff() } }, onDisplayChange: { [weak self] in self?.updateCountdown() })
         if settingsWindow == nil {
             let w = NSWindow(contentRect: .zero, styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
             w.title = "Dont Sleep Settings"
@@ -608,13 +704,16 @@ struct SettingsView: View {
         })
     }
 
+    // The preference can hold anything, and a typed value can be huge: keep every product far from Int overflow
+    private var safeUnit: Int { autoOffUnits.contains { $0.1 == unit } ? unit : 60 }
+
     private var amountBinding: Binding<Int> {
-        Binding(get: { seconds / unit }, set: { seconds = max(1, $0) * unit })
+        Binding(get: { seconds / safeUnit }, set: { seconds = min(max(1, $0), 100_000) * safeUnit })
     }
 
     private var unitBinding: Binding<Int> {
-        Binding(get: { unit }, set: { u in
-            let amount = max(1, seconds / unit)
+        Binding(get: { safeUnit }, set: { u in
+            let amount = min(max(1, seconds / safeUnit), 100_000)
             unit = u
             seconds = amount * u
         })
