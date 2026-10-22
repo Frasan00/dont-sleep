@@ -2,7 +2,8 @@
 
 A small macOS menu bar app that keeps your Mac awake, even with the lid closed, with one switch.
 It runs `pmset -a disablesleep 0|1` for you. It also works from the terminal (see [Command line](#command-line)).
-Local only: no network access, no analytics.
+Everything runs on your Mac. The only network request is an optional once-a-day check of GitHub's public releases page for
+a newer version (you can turn it off); nothing about you or your Mac is sent, and there is no analytics.
 
 - Requires **macOS 14 or later**, on Apple Silicon and Intel.
 - One executable is both the menu bar app and the `dont-sleep` command.
@@ -74,6 +75,20 @@ To stop it from starting at login, turn the same switch off.
 - Restore normal sleep when the app quits. If the app crashes or is force-quit while sleep is disabled, a small helper
   process restores it within seconds, so a laptop is never left awake in a bag.
 
+## Updates
+
+Dont Sleep checks GitHub for a newer release once a day, a few seconds after it starts and then at most every 24 hours.
+When there is one, the menu shows **Version X is available…** at the top of the group below the switch; click it to open the
+release page. **Settings → Updates** shows the installed version and the status, with **Check Now** and a **Download** button,
+and the switch **Check for updates automatically** turns the daily check off. **Check for Updates…** in the menu checks on demand.
+
+The app never downloads or installs anything by itself. To update, download the new DMG and drag **DontSleep** over the old
+app in **Applications** (quit it first). Your settings, the login item and the one-time password setup are kept.
+
+From a terminal, `dont-sleep update` does the same check: it prints the result and exits with `0` when you are up to date,
+`1` when a newer version exists and `4` when the check failed. The only request made is a read-only call to
+`api.github.com`, sending the app name and version in the `User-Agent` header and nothing else.
+
 ## Command line
 
 Link the command into your PATH once:
@@ -95,6 +110,7 @@ dont-sleep off
 dont-sleep config list              # every setting, shared with the menu bar app
 dont-sleep config set auto-off 90m
 dont-sleep config set shortcut-toggle ctrl+opt+cmd+d
+dont-sleep update                   # is there a newer release? (exit status 1 = yes)
 ```
 
 `on` starts a small background process that ends the session when the time is up, even if you close the terminal; the same
@@ -139,4 +155,6 @@ use `./build-dmg.sh v1.2.0` and attach `dist/*.dmg` to a release yourself.
 
 - The app is not notarized: that needs a paid Apple Developer account, so the first launch needs the steps in
   [Install](#option-1-download-the-release-recommended).
+- The update check is the only thing that uses the network. Disable it with **Settings → Updates**, or
+  `dont-sleep config set check-updates off`.
 - Sleep prevention is a single system setting: the menu bar app and the `dont-sleep` command act on the same one.
