@@ -60,6 +60,29 @@ func sudoersInstallScript(dir: String = "/etc/sudoers.d") -> String {
     return "PATH=/usr/bin:/bin:/usr/sbin:/sbin; umask 077; t=\(t); printf \"%s\\n\" \"\(rule)\" > \"$t\" && /usr/sbin/visudo -cf \"$t\" && /usr/sbin/chown root:wheel \"$t\" && /bin/chmod 440 \"$t\" && /bin/mv -f \"$t\" \(dir)/dont-sleep || { /bin/rm -f \"$t\"; exit 1; }"
 }
 
+// Uninstall trashes Bundle.main and deletes ~/Library paths named after the bundle id, so refuse anything that is not clearly the installed app
+func uninstallBlockReason(bundleURL: URL, bundleID: String?) -> String? {
+    if bundleURL.pathExtension != "app" { return "Dont Sleep is not running from an app bundle." }
+    if bundleID != appBundleID { return "This copy has an unexpected bundle identifier." }
+    if bundleURL.path.hasPrefix("/Volumes/") || bundleURL.path.contains("/AppTranslocation/") {
+        return "Move Dont Sleep to your Applications folder first, then uninstall from there."
+    }
+    return nil
+}
+
+func makeUninstallAlert() -> NSAlert {
+    let alert = NSAlert()
+    alert.alertStyle = .warning
+    alert.messageText = "Uninstall Dont Sleep?"
+    alert.informativeText = "This will restore normal sleep, remove the sudoers rule (asks for your password), remove the login item and all saved settings, and move the app to the Trash."
+    // A destructive action must not be the default, so Return cancels
+    let uninstall = alert.addButton(withTitle: "Uninstall")
+    uninstall.hasDestructiveAction = true
+    uninstall.keyEquivalent = ""
+    alert.addButton(withTitle: "Cancel").keyEquivalent = "\r"
+    return alert
+}
+
 func powerInfo() -> (onBattery: Bool, percent: Int)? {
     let info = IOPSCopyPowerSourcesInfo().takeRetainedValue()
     let sources = IOPSCopyPowerSourcesList(info).takeRetainedValue() as [CFTypeRef]
@@ -72,6 +95,7 @@ func powerInfo() -> (onBattery: Bool, percent: Int)? {
 }
 
 let maxAutoOffSeconds = 8_640_000_000
+let appBundleID = "local.dontsleep"
 let sudoersRulePath = "/etc/sudoers.d/dont-sleep"
 let hotkeyNames = ["toggle", "add5"]
 let hotkeyDefaults: [String: (key: Int, label: String)] = ["toggle": (1, "⌃⌥⌘S"), "add5": (23, "⌃⌥⌘5")]
@@ -290,7 +314,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         add("5 minutes", "5", #selector(addFive))
         menu.addItem(.separator())
         menu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",").target = self
+        menu.addItem(.separator())
         menu.addItem(withTitle: "Uninstall…", action: #selector(uninstall), keyEquivalent: "").target = self
+        menu.addItem(.separator())
         menu.addItem(withTitle: "Quit Dont Sleep", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
 
@@ -475,14 +501,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     }
 
     @objc func uninstall() {
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Uninstall Dont Sleep?"
-        alert.informativeText = "This will restore normal sleep, remove the sudoers rule (asks for your password), remove the login item and all saved settings, and move the app to the Trash."
-        alert.addButton(withTitle: "Uninstall").hasDestructiveAction = true
-        alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        if let reason = uninstallBlockReason(bundleURL: Bundle.main.bundleURL, bundleID: Bundle.main.bundleIdentifier) {
+            let a = NSAlert()
+            a.messageText = "Cannot uninstall from here"
+            a.informativeText = reason
+            a.runModal()
+            return
+        }
+        guard makeUninstallAlert().runModal() == .alertFirstButtonReturn else { return }
 
         // Must happen while the sudoers rule still exists, and must not be skipped silently
         if !setSleepDisabled(false) && sleepDisabled() != false {
@@ -492,6 +519,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             a.runModal()
             return
         }
+        refresh()
         guard FileManager.default.fileExists(atPath: sudoersRulePath) else { return finishUninstall() }
         runAsAdmin("/bin/rm -f \(sudoersRulePath)") { [self] result in
             switch result {
@@ -501,6 +529,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
                 let a = NSAlert()
                 a.messageText = "Could not remove the sudoers rule"
                 a.informativeText = "Nothing else was removed. To remove it by hand, run in Terminal:\nsudo rm \(sudoersRulePath)"
+                NSApp.activate(ignoringOtherApps: true)
                 a.runModal()
             case nil:
                 break
@@ -523,12 +552,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             }
         }
         let plist = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Preferences/\(Bundle.main.bundleIdentifier ?? "local.dontsleep").plist").path
-        NSWorkspace.shared.recycle([Bundle.main.bundleURL]) { _, _ in
+        let appPath = Bundle.main.bundleURL.path
+        NSWorkspace.shared.recycle([Bundle.main.bundleURL]) { _, error in
             // The completion handler is not on the main thread
             DispatchQueue.main.async {
                 NSApp.activate(ignoringOtherApps: true)
                 let a = NSAlert()
-                a.messageText = "Dont Sleep was uninstalled"
+                if let error {
+                    a.messageText = "Dont Sleep was removed, but the app is still there"
+                    a.informativeText = "The settings and the sudoers rule are gone, but moving the app to the Trash failed (\(error.localizedDescription)). Delete it by hand:\n\(appPath)"
+                } else {
+                    a.messageText = "Dont Sleep was uninstalled"
+                }
                 a.runModal()
                 // cfprefsd writes an empty plist back a few seconds after removal, so delete it repeatedly from a detached process once we are gone
                 let sh = Process()
