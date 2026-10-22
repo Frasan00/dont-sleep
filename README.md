@@ -1,7 +1,7 @@
 # Dont Sleep
 
 A small macOS menu bar app that keeps your Mac awake, even with the lid closed, with one switch.
-It runs `pmset -a disablesleep 0|1` for you. Local only: no network access, no analytics.
+It runs `pmset -a disablesleep 0|1` for you. It also works from the terminal (see [Command line](#command-line)). Local only: no network access, no analytics.
 
 Requires macOS 14 or later (Apple Silicon and Intel).
 
@@ -34,6 +34,33 @@ If the password prompt does not work for you, choose **Open Terminal** (or **Cop
 - Restores normal sleep when the app quits or starts. If the app crashes or is force-quit while sleep is disabled,
   a small helper process restores it within seconds, so a laptop is not left awake in a bag.
 
+## Command line
+
+The same app is also a terminal tool. Link it into your PATH once:
+
+```
+/Applications/DontSleep.app/Contents/MacOS/DontSleep link
+```
+
+Then use `dont-sleep` from any terminal. `dont-sleep -h` shows the full help, `dont-sleep help <command>` the options of one command.
+
+```
+dont-sleep setup                    # one-time password, same as the menu bar app (needed once per Mac)
+dont-sleep on --for 2h              # on for two hours, returns right away
+dont-sleep on -u 17:30 --unplug-off # until 17:30, or when the charger is unplugged
+dont-sleep on --wait                # stay in the foreground; Ctrl-C turns it off
+dont-sleep run -- ./long-build.sh   # awake only while the command runs
+dont-sleep status --json            # machine-readable state; exit status 0 = on, 1 = off
+dont-sleep off
+dont-sleep config list              # every setting, shared with the menu bar app
+dont-sleep config set auto-off 90m
+dont-sleep config set shortcut-toggle ctrl+opt+cmd+d
+```
+
+`on` starts a small background process that ends the session when the time is up, even if you close the terminal; the same
+crash watchdog as the menu bar app restores normal sleep if that process is killed. Exit statuses: `0` success, `2` wrong usage,
+`3` setup missing, `4` operation failed (`run` returns the exit status of your command).
+
 ## Uninstall
 
 Use **Uninstall…** in the menu. It restores sleep, removes the sudoers rule (asks for your password), the login item and
@@ -45,7 +72,7 @@ If you deleted the app by hand instead, remove the rule with `sudo rm /etc/sudoe
 ## Build
 
 ```
-./build.sh                # DontSleep.app, universal binary
+./build.sh                # DontSleep.app, universal binary (menu bar app and command line in one executable)
 ./build-dmg.sh v1.2.0     # dist/DontSleep-1.2.0.dmg and a .sha256
 ```
 
