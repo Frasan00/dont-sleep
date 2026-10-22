@@ -102,6 +102,9 @@ let hotkeyDefaults: [String: (key: Int, label: String)] = ["toggle": (1, "⌃⌥
 let hotkeyDefaultMods = controlKey | optionKey | cmdKey
 var hotkeyActions: [UInt32: () -> Void] = [:]
 var hotkeyRefs: [EventHotKeyRef] = []
+// Names whose registration was refused (combination already taken), so the UI can say so
+var hotkeyFailed: Set<String> = []
+var hotkeySnapshot = ""
 // Set while a shortcut is being recorded so the current binding does not fire
 var recordingShortcut = false
 
@@ -115,9 +118,18 @@ func installHotkeyHandler() {
     }, 1, &spec, nil, nil)
 }
 
+func currentHotkeySnapshot() -> String {
+    let d = UserDefaults.standard
+    return hotkeyNames.map { "\(d.integer(forKey: "hk.\($0).key")):\(d.integer(forKey: "hk.\($0).mods"))" }.joined(separator: ",")
+}
+
 func registerHotkeys() {
+    // While a shortcut is being recorded the bindings stay unregistered so the combination reaches the recorder
+    guard !recordingShortcut else { return }
     hotkeyRefs.forEach { UnregisterEventHotKey($0) }
     hotkeyRefs = []
+    hotkeyFailed = []
+    hotkeySnapshot = currentHotkeySnapshot()
     for (i, name) in hotkeyNames.enumerated() {
         // Values come from user defaults, so anything outside the valid ranges is ignored instead of trapping
         let key = UserDefaults.standard.integer(forKey: "hk.\(name).key")
@@ -127,6 +139,8 @@ func registerHotkeys() {
         let id = EventHotKeyID(signature: OSType(0x44534C50), id: UInt32(i + 1))
         if RegisterEventHotKey(UInt32(key), UInt32(mods), id, GetApplicationEventTarget(), 0, &ref) == noErr, let ref {
             hotkeyRefs.append(ref)
+        } else {
+            hotkeyFailed.insert(name)
         }
     }
 }
@@ -335,7 +349,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         hotkeyActions = [1: { [unowned self] in refresh(); toggled() }, 2: { [unowned self] in keepAwake(seconds: 300, extend: true) }]
         installHotkeyHandler()
         registerHotkeys()
-        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { _ in registerHotkeys() }
+        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { _ in
+            // Settings writes many unrelated keys; only a real change of a shortcut needs re-registering
+            if currentHotkeySnapshot() != hotkeySnapshot { registerHotkeys() }
+        }
+        // Nothing else appears on launch, so show Settings once to tell a new user where the app lives
+        if defaults.object(forKey: "didFirstRun") == nil {
+            defaults.set(true, forKey: "didFirstRun")
+            DispatchQueue.main.async { self.openSettings() }
+        }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [unowned self] _ in checkDeadline() }
         NotificationCenter.default.addObserver(forName: .NSSystemClockDidChange, object: nil, queue: .main) { [unowned self] _ in checkDeadline() }
     }
@@ -467,6 +489,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             }
         }
 
+        let copy = { [self] in
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(cmd, forType: .string)
+            let a = NSAlert()
+            a.messageText = "Command copied"
+            a.informativeText = "Paste it in Terminal and press Return. Dont Sleep carries on by itself when it finishes."
+            NSApp.activate(ignoringOtherApps: true)
+            a.runModal()
+            waitForSudoRule(retry)
+        }
+
         if nativeFailed {
             alert.informativeText = "The password prompt did not complete. Open Terminal to run this command instead (it asks for your password once)."
             let field = NSTextField(wrappingLabelWithString: cmd)
@@ -474,6 +507,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             field.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
             field.frame = NSRect(x: 0, y: 0, width: 440, height: 88)
             alert.accessoryView = field
+            button("Open Terminal", openTerminal)
+            button("Copy Command", copy)
         } else {
             alert.informativeText = "Dont Sleep needs your password once to change the sleep setting without asking again. It only allows turning sleep prevention on and off."
             button("Install") { [self] in
@@ -487,11 +522,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
                     }
                 }
             }
-        }
-        button("Open Terminal", openTerminal)
-        button("Copy Command") {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(cmd, forType: .string)
+            button("Open Terminal", openTerminal)
         }
         button("Cancel") {}
 
@@ -707,6 +738,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         RunLoop.main.add(t, forMode: .common)
         autoOffTimer = t
         armWatchdog()
+        ensureNotificationPermission()
+    }
+
+    // Ask when a timer starts, so the prompt is seen while the user is at the Mac and not when the timer fires
+    func ensureNotificationPermission() {
+        guard defaults.bool(forKey: "notifyAutoOff") else { return }
+        let c = UNUserNotificationCenter.current()
+        c.getNotificationSettings { st in
+            if st.authorizationStatus == .notDetermined { c.requestAuthorization(options: [.alert, .sound]) { _, _ in } }
+        }
     }
 
     // The timer follows a clock that stops while the Mac sleeps, and the user can change the wall clock
@@ -781,6 +822,8 @@ struct SettingsView: View {
     @AppStorage("lowBatteryOff") private var lowBatteryOff = false
     @AppStorage("lowBatteryPercent") private var lowBatteryPercent = 20
     @State private var login = SMAppService.mainApp.status == .enabled
+    @State private var loginNote: String?
+    @State private var notificationsDenied = false
     @State private var custom = !autoOffChoices.contains { $0.1 == UserDefaults.standard.integer(forKey: "autoOffSeconds") }
     let maxHeight: CGFloat
     let onAutoOffChange: () -> Void
@@ -788,10 +831,15 @@ struct SettingsView: View {
 
     private var loginBinding: Binding<Bool> {
         Binding(get: { login }, set: { on in
+            loginNote = nil
             do {
                 if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
-            } catch {}
-            login = SMAppService.mainApp.status == .enabled
+            } catch {
+                loginNote = "Could not change the login item: \(error.localizedDescription)"
+            }
+            let status = SMAppService.mainApp.status
+            login = status == .enabled
+            if on && status == .requiresApproval { loginNote = "Approve Dont Sleep in System Settings → General → Login Items to finish." }
         })
     }
 
@@ -822,15 +870,31 @@ struct SettingsView: View {
         })
     }
 
-    private var desiredHeight: CGFloat { (custom ? 110 : 0) + (lowBatteryOff ? 44 : 0) + 630 }
+    private var desiredHeight: CGFloat { (custom ? 110 : 0) + (lowBatteryOff ? 44 : 0) + (loginNote != nil ? 56 : 0) + (notifyAutoOff && notificationsDenied ? 56 : 0) + 630 }
+
+    private func refreshNotificationStatus() {
+        UNUserNotificationCenter.current().getNotificationSettings { st in
+            DispatchQueue.main.async { notificationsDenied = st.authorizationStatus == .denied }
+        }
+    }
 
     var body: some View {
         Form {
             Section("General") {
                 Toggle("Launch at login", isOn: loginBinding)
+                if let note = loginNote {
+                    Text(note).font(.caption).foregroundStyle(.secondary)
+                    Button("Open Login Items Settings") { SMAppService.openSystemSettingsLoginItems() }
+                }
                 Toggle("Restore normal sleep when the app starts", isOn: $resetOnLaunch)
                 Toggle("Restore normal sleep when the app quits", isOn: $restoreOnQuit)
                 Toggle("Notify when sleep is restored automatically", isOn: $notifyAutoOff)
+                if notifyAutoOff && notificationsDenied {
+                    Text("Notifications are turned off for Dont Sleep in System Settings.").font(.caption).foregroundStyle(.secondary)
+                    Button("Open Notification Settings") {
+                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")!)
+                    }
+                }
                 Toggle("Show remaining time in the menu bar", isOn: $showCountdown)
             }
             Section("Auto-off") {
@@ -867,10 +931,14 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .scrollDisabled(desiredHeight <= maxHeight)
         .frame(width: 400, height: min(desiredHeight, maxHeight))
         .onChange(of: seconds) { onAutoOffChange() }
         .onChange(of: showCountdown) { onDisplayChange() }
+        .onChange(of: notifyAutoOff) {
+            guard notifyAutoOff else { return }
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in refreshNotificationStatus() }
+        }
+        .onAppear { refreshNotificationStatus() }
     }
 }
 
@@ -882,6 +950,8 @@ struct ShortcutRow: View {
     @AppStorage private var label: String
     @State private var recording = false
     @State private var monitor: Any?
+    @State private var error: String?
+    @State private var failed = false
 
     init(title: String, name: String) {
         self.title = title
@@ -895,38 +965,62 @@ struct ShortcutRow: View {
 
     var body: some View {
         LabeledContent(title) {
-            HStack(spacing: 6) {
-                Button(recording ? "Press shortcut…" : (key < 0 ? "None" : label)) { recording ? stop() : start() }
-                    .frame(minWidth: 100)
-                if !isDefault {
-                    Button { reset() } label: { Image(systemName: "arrow.counterclockwise") }
-                        .buttonStyle(.borderless).help("Restore default")
+            VStack(alignment: .trailing, spacing: 2) {
+                HStack(spacing: 6) {
+                    Button(recording ? "Press shortcut…" : (key < 0 ? "None" : label)) { recording ? stop() : start() }
+                        .frame(minWidth: 100)
+                    if !isDefault {
+                        Button { reset() } label: { Image(systemName: "arrow.counterclockwise") }
+                            .buttonStyle(.borderless).help("Restore default").accessibilityLabel("Restore default shortcut")
+                    }
+                    if key >= 0 {
+                        Button { key = -1; registerHotkeys() } label: { Image(systemName: "xmark.circle.fill") }
+                            .buttonStyle(.borderless).help("Remove shortcut").accessibilityLabel("Remove shortcut")
+                    }
                 }
-                if key >= 0 {
-                    Button { key = -1 } label: { Image(systemName: "xmark.circle.fill") }
-                        .buttonStyle(.borderless).help("Remove shortcut")
+                if let message = error ?? (failed && key >= 0 ? "Unavailable: macOS or another app already uses it." : nil) {
+                    Text(message).font(.caption).foregroundStyle(.red)
                 }
             }
         }
+        .onAppear { failed = hotkeyFailed.contains(name) }
         .onDisappear { stop() }
+        // Switching to another app must not leave the global shortcuts switched off
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { _ in stop() }
     }
 
     private func reset() {
         key = hotkeyDefaults[name]!.key
         mods = hotkeyDefaultMods
         label = hotkeyDefaults[name]!.label
+        error = nil
+        registerHotkeys()
+        failed = hotkeyFailed.contains(name)
     }
 
     private func start() {
         recording = true
         recordingShortcut = true
+        error = nil
+        // Unregister everything so the combination being pressed reaches this recorder instead of firing an action
+        hotkeyRefs.forEach { UnregisterEventHotKey($0) }
+        hotkeyRefs = []
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
             let f = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
             if e.keyCode == 53 { stop(); return nil }
             // A global shortcut without ⌘, ⌥ or ⌃ would hijack normal typing
             guard !f.isDisjoint(with: [.command, .option, .control]) else { NSSound.beep(); return nil }
+            let newMods = (f.contains(.command) ? cmdKey : 0) | (f.contains(.option) ? optionKey : 0) | (f.contains(.control) ? controlKey : 0) | (f.contains(.shift) ? shiftKey : 0)
+            let other = hotkeyNames.first { $0 != name }!
+            let d = UserDefaults.standard
+            if d.integer(forKey: "hk.\(other).key") == Int(e.keyCode) && d.integer(forKey: "hk.\(other).mods") == newMods {
+                NSSound.beep()
+                error = "Already used by the other shortcut."
+                stop()
+                return nil
+            }
             key = Int(e.keyCode)
-            mods = (f.contains(.command) ? cmdKey : 0) | (f.contains(.option) ? optionKey : 0) | (f.contains(.control) ? controlKey : 0) | (f.contains(.shift) ? shiftKey : 0)
+            mods = newMods
             label = shortcutLabel(e)
             stop()
             return nil
@@ -934,10 +1028,13 @@ struct ShortcutRow: View {
     }
 
     private func stop() {
+        guard recording else { return }
         recording = false
         recordingShortcut = false
         if let monitor { NSEvent.removeMonitor(monitor) }
         monitor = nil
+        registerHotkeys()
+        failed = hotkeyFailed.contains(name)
     }
 }
 
