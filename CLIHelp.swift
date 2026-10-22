@@ -2,7 +2,7 @@ import Foundation
 
 // All user-facing help text of the command line interface.
 enum Help {
-    static let order = ["on", "off", "toggle", "status", "run", "config", "setup", "remove-rule", "link", "unlink", "help", "version"]
+    static let order = ["on", "off", "toggle", "status", "run", "config", "update", "setup", "remove-rule", "link", "unlink", "help", "version"]
 
     static let main = """
     dont-sleep - keep your Mac awake, even with the lid closed
@@ -20,6 +20,7 @@ enum Help {
       run [options] -- CMD [ARGS...]
                             Keep the Mac awake only while CMD runs
       config <action>       Show and change settings (shared with the menu bar app)
+      update [options]      Check GitHub for a newer release
       setup                 One-time setup: allow changing sleep without a password
       remove-rule           Undo the setup
       link | unlink         Add or remove 'dont-sleep' in your PATH
@@ -42,8 +43,8 @@ enum Help {
       A time of day that already passed today means tomorrow.
 
     SETTINGS (dont-sleep config list)
-      auto-off, restore-on-start, restore-on-quit, notify, show-countdown, unplug-off,
-      low-battery-off, low-battery-percent, launch-at-login, shortcut-toggle, shortcut-add5.
+      auto-off, restore-on-start, restore-on-quit, notify, show-countdown, check-updates,
+      unplug-off, low-battery-off, low-battery-percent, launch-at-login, shortcut-toggle, shortcut-add5.
       Defaults of the options of 'on' come from these settings, and options override them.
 
     EXIT STATUS
@@ -51,7 +52,7 @@ enum Help {
       1   'status': sleep prevention is off. Other commands: cancelled
       2   Wrong usage: unknown command or option, invalid value
       3   The one-time setup is missing: run 'dont-sleep setup'
-      4   The operation failed (pmset, sudo, or reading the state)
+      4   The operation failed (pmset, sudo, reading the state, or reaching GitHub)
       127 'run': the command could not be started. Otherwise 'run' returns the exit status of CMD.
 
     FILES
@@ -77,6 +78,7 @@ enum Help {
       dont-sleep config set auto-off 90m
       dont-sleep config set shortcut-toggle ctrl+opt+cmd+d
       dont-sleep link                        Install the command in your PATH
+      dont-sleep update                      Is there a newer release?
 
     NOTES
       'on' starts a small background process that turns sleep prevention off when the time is up,
@@ -190,6 +192,7 @@ enum Help {
           restore-on-quit       on|off  Menu bar app: restore normal sleep when it quits (arms the crash watchdog)
           notify                on|off  Notify when sleep is restored automatically
           show-countdown        on|off  Menu bar app: remaining time next to the icon
+          check-updates         on|off  Menu bar app: look for new releases on GitHub once a day
           unplug-off            on|off  Turn off when the charger is unplugged
           low-battery-off       on|off  Turn off when the battery gets low
           low-battery-percent   5-90    Battery level for low-battery-off
@@ -209,6 +212,31 @@ enum Help {
           dont-sleep config set low-battery-percent 25
           dont-sleep config get shortcut-toggle
           dont-sleep config reset
+        """,
+        "update": """
+        dont-sleep update - check for a newer release
+
+        USAGE
+          dont-sleep update [options]
+
+        OPTIONS
+          -j, --json    Machine-readable output
+          -q, --quiet   Print nothing; use the exit status only
+          -h, --help    Show this help
+
+        Asks the public GitHub API for the latest release of Dont Sleep and compares it with the installed version.
+        It only reports: nothing is downloaded or installed, and the download page is yours to open.
+        The menu bar app does the same check once a day unless 'check-updates' is off.
+
+        EXIT STATUS
+          0   You have the latest version
+          1   A newer version is available
+          4   The check failed (no connection, rate limit, unexpected answer)
+
+        EXAMPLES
+          dont-sleep update
+          dont-sleep update --json
+          dont-sleep update -q || echo "update available (or check failed)"
         """,
         "setup": """
         dont-sleep setup - one-time setup

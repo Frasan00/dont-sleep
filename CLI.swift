@@ -13,7 +13,7 @@ private var cliStopSignal: Int32 = 0
 private var cliHandover: Int32 = 0
 
 enum CLI {
-    static let subcommands: Set<String> = ["on", "off", "toggle", "status", "run", "config", "setup", "remove-rule", "link", "unlink", "help", "version", "__guard", "__login"]
+    static let subcommands: Set<String> = ["on", "off", "toggle", "status", "run", "config", "setup", "remove-rule", "link", "unlink", "update", "help", "version", "__guard", "__login"]
 
     static func shouldRun(_ args: [String]) -> Bool {
         if URL(fileURLWithPath: args.first ?? "").lastPathComponent == "dont-sleep" { return true }
@@ -50,6 +50,7 @@ enum CLI {
         case "run": return try cmdRun(rest)
         case "config": return try cmdConfig(rest)
         case "setup": return try cmdSetup(rest)
+        case "update": return try cmdUpdate(rest)
         case "remove-rule": return try cmdRemoveRule(rest)
         case "link": return try cmdLink(rest, remove: false)
         case "unlink": return try cmdLink(rest, remove: true)
@@ -65,9 +66,7 @@ enum CLI {
         return Bundle(path: String(selfPath[..<range.lowerBound]) + ".app")
     }
 
-    static var version: String {
-        (appBundle?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "dev"
-    }
+    static var version: String { currentVersion() ?? "dev" }
 
     // MARK: output helpers
 
@@ -635,6 +634,7 @@ enum CLI {
         Setting(key: "restore-on-start", pref: "resetOnLaunch", kind: .bool, def: "on", help: "Menu bar app: restore normal sleep when it starts"),
         Setting(key: "restore-on-quit", pref: "restoreOnQuit", kind: .bool, def: "on", help: "Menu bar app: restore normal sleep when it quits (also arms the crash watchdog)"),
         Setting(key: "notify", pref: "notifyAutoOff", kind: .bool, def: "on", help: "Notify when sleep is restored automatically"),
+        Setting(key: "check-updates", pref: "checkUpdates", kind: .bool, def: "on", help: "Menu bar app: look for new releases on GitHub once a day"),
         Setting(key: "show-countdown", pref: "showCountdown", kind: .bool, def: "on", help: "Menu bar app: show the remaining time next to the icon"),
         Setting(key: "unplug-off", pref: "offWhenUnplugged", kind: .bool, def: "off", help: "Turn off when the charger is unplugged"),
         Setting(key: "low-battery-off", pref: "lowBatteryOff", kind: .bool, def: "off", help: "Turn off when the battery gets low"),
@@ -954,6 +954,48 @@ enum CLI {
         guard status == 0 else { printErr("dont-sleep: could not remove the rule"); return 4 }
         print("Rule removed.")
         return 0
+    }
+
+    // MARK: update
+
+    final class FetchBox { var result: Result<ReleaseInfo, Error>? }
+
+    static func cmdUpdate(_ argv: [String]) throws -> Int32 {
+        let a = try parse(argv, Spec(flags: ["json", "quiet"], short: ["q": "quiet", "j": "json"]))
+        if a.flags.contains("help") { print(Help.commands["update"]!); return 0 }
+        if let extra = a.positional.first { throw UsageError(message: "unexpected argument '\(extra)'") }
+        let box = FetchBox()
+        let done = DispatchSemaphore(value: 0)
+        Task {
+            do { box.result = .success(try await fetchLatestRelease()) } catch { box.result = .failure(error) }
+            done.signal()
+        }
+        done.wait()
+        let current = currentVersion()
+        switch box.result! {
+        case .failure(let error):
+            if a.flags.contains("json") {
+                print(String(data: (try? JSONSerialization.data(withJSONObject: ["error": error.localizedDescription], options: [.sortedKeys, .prettyPrinted])) ?? Data(), encoding: .utf8) ?? "{}")
+            } else {
+                printErr("dont-sleep: could not check for updates: \(error.localizedDescription)")
+            }
+            return 4
+        case .success(let r):
+            let newer = current.map { isNewerVersion(r.version, than: $0) } ?? false
+            if a.flags.contains("json") {
+                let o: [String: Any] = ["current": current.map { $0 as Any } ?? NSNull(), "latest": r.version, "tag": r.tag, "updateAvailable": newer, "url": r.url.absoluteString]
+                print(String(data: (try? JSONSerialization.data(withJSONObject: o, options: [.sortedKeys, .prettyPrinted])) ?? Data(), encoding: .utf8) ?? "{}")
+            } else if !a.flags.contains("quiet") {
+                if newer {
+                    print("Update available: \(r.version) (you have \(current ?? "unknown")).\nDownload: \(r.url.absoluteString)")
+                } else if let current {
+                    print("dont-sleep \(current) is up to date (latest release: \(r.tag)).")
+                } else {
+                    print("Latest release: \(r.tag) (this build has no version number).\nDownload: \(r.url.absoluteString)")
+                }
+            }
+            return newer ? 1 : 0
+        }
     }
 
     // MARK: link / unlink
