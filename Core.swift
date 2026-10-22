@@ -95,3 +95,86 @@ func startWatchdog(pid: Int32, until: Int?) -> Process? {
     p.standardError = FileHandle.nullDevice
     return (try? p.run()) != nil ? p : nil
 }
+
+// MARK: updates
+
+// The only network request the app ever makes: the public GitHub API, read-only, no identifiers sent.
+let updateAPIURL = "https://api.github.com/repos/Frasan00/dont-sleep/releases/latest"
+
+struct ReleaseInfo: Equatable {
+    let version: String
+    let tag: String
+    let url: URL
+}
+
+enum UpdateError: LocalizedError {
+    case network(String)
+    case http(Int)
+    case invalid
+    case noRelease
+
+    var errorDescription: String? {
+        switch self {
+        case .network(let m): return "No connection to GitHub (\(m))"
+        case .http(403), .http(429): return "GitHub is limiting requests right now, try again later"
+        case .http(let c): return "GitHub answered with status \(c)"
+        case .invalid: return "GitHub sent an unexpected answer"
+        case .noRelease: return "No release has been published yet"
+        }
+    }
+}
+
+// The running version: from Bundle.main, or from the app that contains the executable when started through a symlink
+func currentVersion() -> String? {
+    if let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String { return v }
+    let exe = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0])).resolvingSymlinksInPath().path
+    guard let r = exe.range(of: ".app/Contents/MacOS/"), let b = Bundle(path: String(exe[..<r.lowerBound]) + ".app") else { return nil }
+    return b.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+}
+
+// "v1.2.3", "1.2" and "1.2.3-beta" all reduce to their numeric parts
+func versionComponents(_ s: String) -> [Int] {
+    var t = s.trimmingCharacters(in: .whitespaces)
+    if t.hasPrefix("v") || t.hasPrefix("V") { t.removeFirst() }
+    return t.prefix { $0.isNumber || $0 == "." }.split(separator: ".").map { Int($0) ?? 0 }
+}
+
+func isNewerVersion(_ candidate: String, than current: String) -> Bool {
+    let a = versionComponents(candidate), b = versionComponents(current)
+    guard !a.isEmpty else { return false }
+    for i in 0..<max(a.count, b.count) {
+        let x = i < a.count ? a[i] : 0
+        let y = i < b.count ? b[i] : 0
+        if x != y { return x > y }
+    }
+    return false
+}
+
+func parseLatestRelease(_ data: Data) throws -> ReleaseInfo {
+    guard let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let tag = o["tag_name"] as? String, !versionComponents(tag).isEmpty else { throw UpdateError.invalid }
+    // Whatever the response says, the only page this ever opens is a https page on github.com
+    guard let page = o["html_url"] as? String, let url = URL(string: page), url.scheme == "https", url.host == "github.com" else { throw UpdateError.invalid }
+    return ReleaseInfo(version: versionComponents(tag).map(String.init).joined(separator: "."), tag: tag, url: url)
+}
+
+func fetchLatestRelease(apiURL: String = updateAPIURL, timeout: TimeInterval = 10) async throws -> ReleaseInfo {
+    guard let url = URL(string: apiURL) else { throw UpdateError.invalid }
+    var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
+    request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+    request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+    request.setValue("DontSleep/\(currentVersion() ?? "dev")", forHTTPHeaderField: "User-Agent")
+    let data: Data
+    let response: URLResponse
+    do {
+        (data, response) = try await URLSession(configuration: .ephemeral).data(for: request)
+    } catch {
+        throw UpdateError.network(error.localizedDescription)
+    }
+    guard let http = response as? HTTPURLResponse, data.count < 1_000_000 else { throw UpdateError.invalid }
+    switch http.statusCode {
+    case 200: return try parseLatestRelease(data)
+    case 404: throw UpdateError.noRelease
+    default: throw UpdateError.http(http.statusCode)
+    }
+}

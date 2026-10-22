@@ -206,6 +206,69 @@ func installMainMenu() {
     NSApp.mainMenu = main
 }
 
+// Update state shared by the menu and the Settings window. It only ever opens the release page: nothing is downloaded or installed.
+final class UpdateChecker: ObservableObject {
+    enum State: Equatable {
+        case idle, checking, upToDate
+        case available(ReleaseInfo)
+    }
+
+    static let shared = UpdateChecker()
+    @Published var state: State = .idle
+    // Kept apart from the state so a failed check never hides an update that is already known
+    @Published var error: String?
+    @Published var lastChecked: Date?
+    private let defaults = UserDefaults.standard
+    var current: String { currentVersion() ?? "unknown" }
+
+    init() {
+        lastChecked = defaults.object(forKey: "lastUpdateCheck") as? Date
+        // The result of the last check is cached, so the menu can show a pending update right after launch
+        if let v = defaults.string(forKey: "updateLatestVersion"), let page = defaults.string(forKey: "updateLatestURL"), let url = URL(string: page), url.host == "github.com" {
+            if isNewerVersion(v, than: current) { state = .available(ReleaseInfo(version: v, tag: "v" + v, url: url)) } else if lastChecked != nil { state = .upToDate }
+        }
+    }
+
+    // Automatic checks stay silent when they fail; only a manual check reports the error
+    func check(manual: Bool, completion: ((State, String?) -> Void)? = nil) {
+        guard state != .checking else { return }
+        let previous = state
+        state = .checking
+        error = nil
+        Task {
+            do {
+                let release = try await fetchLatestRelease()
+                await MainActor.run {
+                    self.apply(release)
+                    completion?(self.state, nil)
+                }
+            } catch {
+                await MainActor.run {
+                    self.state = previous
+                    if manual { self.error = error.localizedDescription }
+                    completion?(self.state, self.error)
+                }
+            }
+        }
+    }
+
+    private func apply(_ r: ReleaseInfo) {
+        let now = Date()
+        lastChecked = now
+        defaults.set(now, forKey: "lastUpdateCheck")
+        defaults.set(r.version, forKey: "updateLatestVersion")
+        defaults.set(r.url.absoluteString, forKey: "updateLatestURL")
+        state = isNewerVersion(r.version, than: current) ? .available(r) : .upToDate
+    }
+
+    // Once a day at most, and never when the user turned it off or when this is not a real app bundle
+    func checkIfDue() {
+        guard defaults.bool(forKey: "checkUpdates"), currentVersion() != nil else { return }
+        if let last = lastChecked, Date().timeIntervalSince(last) < 24 * 3600 { return }
+        check(manual: false)
+    }
+}
+
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let toggle = Pill(frame: NSRect(x: 0, y: 0, width: 54, height: 28))
@@ -220,11 +283,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     var sudoWaitTimer: Timer?
     var termSource: DispatchSourceSignal?
     var settingsWindow: NSWindow?
+    var updateItem: NSMenuItem?
+    var updateTimer: Timer?
     var wasOnBattery: Bool?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         defaults.register(defaults: ["resetOnLaunch": true, "restoreOnQuit": true, "autoOffSeconds": 0,
-                                     "notifyAutoOff": true, "showCountdown": true, "offWhenUnplugged": false, "lowBatteryOff": false, "lowBatteryPercent": 20])
+                                     "notifyAutoOff": true, "showCountdown": true, "checkUpdates": true, "offWhenUnplugged": false, "lowBatteryOff": false, "lowBatteryPercent": 20])
         for n in hotkeyNames {
             defaults.register(defaults: ["hk.\(n).key": hotkeyDefaults[n]!.key, "hk.\(n).mods": hotkeyDefaultMods, "hk.\(n).label": hotkeyDefaults[n]!.label])
         }
@@ -253,6 +318,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         add("5 minutes", "5", #selector(addFive))
         menu.addItem(.separator())
         menu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",").target = self
+        let update = menu.addItem(withTitle: "Check for Updates…", action: #selector(updateMenuClicked), keyEquivalent: "")
+        update.target = self
+        updateItem = update
         menu.addItem(.separator())
         menu.addItem(withTitle: "Uninstall…", action: #selector(uninstall), keyEquivalent: "").target = self
         menu.addItem(.separator())
@@ -283,6 +351,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             defaults.set(true, forKey: "didFirstRun")
             DispatchQueue.main.async { self.openSettings() }
         }
+        // A short delay keeps the launch itself quick, then a cheap timer re-checks whether a day has passed
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { UpdateChecker.shared.checkIfDue() }
+        let t = Timer(timeInterval: 6 * 3600, repeats: true) { _ in UpdateChecker.shared.checkIfDue() }
+        t.tolerance = 600
+        RunLoop.main.add(t, forMode: .common)
+        updateTimer = t
         DistributedNotificationCenter.default().addObserver(forName: settingsChangedNotification, object: nil, queue: .main) { [unowned self] _ in
             if currentHotkeySnapshot() != hotkeySnapshot { registerHotkeys() }
             updateCountdown()
@@ -295,7 +369,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         done([.banner, .sound])
     }
 
-    func menuWillOpen(_ menu: NSMenu) { refresh() }
+    func menuWillOpen(_ menu: NSMenu) {
+        refresh()
+        refreshUpdateItem()
+    }
 
     func applicationWillTerminate(_ n: Notification) {
         // Restore also when the state is unknown: setting 0 is harmless if sleep was already allowed
@@ -703,6 +780,56 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     @objc func addThirty() { keepAwake(seconds: 1800, extend: true) }
     @objc func addFive() { keepAwake(seconds: 300, extend: true) }
 
+    func refreshUpdateItem() {
+        guard let item = updateItem else { return }
+        item.image = nil
+        item.isEnabled = true
+        switch UpdateChecker.shared.state {
+        case .available(let r):
+            item.title = "Version \(r.version) is available…"
+            item.image = NSImage(systemSymbolName: "arrow.down.circle.fill", accessibilityDescription: "Update available")
+        case .checking:
+            item.title = "Checking for Updates…"
+            item.isEnabled = false
+        default:
+            item.title = "Check for Updates…"
+        }
+    }
+
+    @objc func updateMenuClicked() {
+        if case .available(let r) = UpdateChecker.shared.state {
+            NSWorkspace.shared.open(r.url)
+            return
+        }
+        UpdateChecker.shared.check(manual: true) { [self] state, error in presentUpdateResult(state, error) }
+    }
+
+    func presentUpdateResult(_ state: UpdateChecker.State, _ error: String?) {
+        let alert = NSAlert()
+        if let error {
+            alert.messageText = "Could not check for updates"
+            alert.informativeText = error
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+            return
+        }
+        switch state {
+        case .available(let r):
+            alert.messageText = "Version \(r.version) is available"
+            alert.informativeText = "You have \(UpdateChecker.shared.current). The download page opens in your browser; install it like the first time, over the old app."
+            alert.addButton(withTitle: "Download…")
+            alert.addButton(withTitle: "Later")
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(r.url) }
+            return
+        default:
+            alert.messageText = "You are up to date"
+            alert.informativeText = "Dont Sleep \(UpdateChecker.shared.current) is the latest version."
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
     @objc func openSettings() {
         // center() uses NSScreen.main, which can be a different display than the one the user is looking at
         let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main
@@ -739,6 +866,8 @@ struct SettingsView: View {
     @AppStorage("autoOffUnit") private var unit = 60
     @AppStorage("notifyAutoOff") private var notifyAutoOff = true
     @AppStorage("showCountdown") private var showCountdown = true
+    @AppStorage("checkUpdates") private var checkUpdates = true
+    @ObservedObject private var updates = UpdateChecker.shared
     @AppStorage("offWhenUnplugged") private var offWhenUnplugged = false
     @AppStorage("lowBatteryOff") private var lowBatteryOff = false
     @AppStorage("lowBatteryPercent") private var lowBatteryPercent = 20
@@ -791,7 +920,25 @@ struct SettingsView: View {
         })
     }
 
-    private var desiredHeight: CGFloat { (custom ? 110 : 0) + (lowBatteryOff ? 44 : 0) + (loginNote != nil ? 56 : 0) + (notifyAutoOff && notificationsDenied ? 56 : 0) + 630 }
+    @ViewBuilder private var updateStatus: some View {
+        if let error = updates.error {
+            Text(error).foregroundStyle(.red).multilineTextAlignment(.trailing)
+        } else {
+            switch updates.state {
+            case .checking: Text("Checking…").foregroundStyle(.secondary)
+            case .upToDate: Text("Up to date").foregroundStyle(.secondary)
+            case .available(let r): Text("Version \(r.version) is available")
+            case .idle:
+                if let last = updates.lastChecked {
+                    Text("Checked \(RelativeDateTimeFormatter().localizedString(for: last, relativeTo: Date()))").foregroundStyle(.secondary)
+                } else {
+                    Text("Not checked yet").foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    private var desiredHeight: CGFloat { (custom ? 110 : 0) + 200 + (lowBatteryOff ? 44 : 0) + (loginNote != nil ? 56 : 0) + (notifyAutoOff && notificationsDenied ? 56 : 0) + 630 }
 
     private func refreshNotificationStatus() {
         UNUserNotificationCenter.current().getNotificationSettings { st in
@@ -843,6 +990,17 @@ struct SettingsView: View {
                 ShortcutRow(title: "Toggle sleep prevention", name: "toggle")
                 ShortcutRow(title: "Add 5 minutes", name: "add5")
             }
+            Section("Updates") {
+                Toggle("Check for updates automatically", isOn: $checkUpdates)
+                LabeledContent("Installed version", value: updates.current)
+                LabeledContent("Status") { updateStatus }
+                HStack {
+                    Button("Check Now") { updates.check(manual: true) }.disabled(updates.state == .checking)
+                    if case .available(let r) = updates.state {
+                        Button("Download \(r.tag)…") { NSWorkspace.shared.open(r.url) }
+                    }
+                }
+            }
             Section("Battery") {
                 Toggle("Turn off when unplugged", isOn: $offWhenUnplugged)
                 Toggle("Turn off when battery is low", isOn: $lowBatteryOff)
@@ -855,6 +1013,7 @@ struct SettingsView: View {
         .frame(width: 400, height: min(desiredHeight, maxHeight))
         .onChange(of: seconds) { onAutoOffChange() }
         .onChange(of: showCountdown) { onDisplayChange() }
+        .onChange(of: checkUpdates) { if checkUpdates { updates.check(manual: false) } }
         .onChange(of: notifyAutoOff) {
             guard notifyAutoOff else { return }
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in refreshNotificationStatus() }
