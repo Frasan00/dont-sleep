@@ -283,6 +283,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             defaults.set(true, forKey: "didFirstRun")
             DispatchQueue.main.async { self.openSettings() }
         }
+        DistributedNotificationCenter.default().addObserver(forName: settingsChangedNotification, object: nil, queue: .main) { [unowned self] _ in
+            if currentHotkeySnapshot() != hotkeySnapshot { registerHotkeys() }
+            updateCountdown()
+        }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [unowned self] _ in checkDeadline() }
         NotificationCenter.default.addObserver(forName: .NSSystemClockDidChange, object: nil, queue: .main) { [unowned self] _ in checkDeadline() }
     }
@@ -954,6 +958,9 @@ struct ShortcutRow: View {
         failed = hotkeyFailed.contains(name)
     }
 }
+
+// Called as `dont-sleep` (or with a subcommand) this is the command line tool; otherwise the menu bar app starts
+if CLI.shouldRun(CommandLine.arguments) { CLI.main(CommandLine.arguments) }
 
 let app = NSApplication.shared
 let delegate = App()

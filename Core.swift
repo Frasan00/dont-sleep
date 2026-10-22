@@ -72,6 +72,8 @@ func powerInfo() -> (onBattery: Bool, percent: Int)? {
 
 let maxAutoOffSeconds = 8_640_000_000
 let appBundleID = "local.dontsleep"
+// Posted by the command line after it changes a setting, because preference writes from another process do not notify the app
+let settingsChangedNotification = Notification.Name("local.dontsleep.settingsChanged")
 let sudoersRulePath = "/etc/sudoers.d/dont-sleep"
 let hotkeyNames = ["toggle", "add5"]
 let hotkeyDefaults: [String: (key: Int, label: String)] = ["toggle": (1, "⌃⌥⌘S"), "add5": (23, "⌃⌥⌘5")]

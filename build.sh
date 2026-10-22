@@ -6,7 +6,7 @@ APP=DontSleep.app
 VERSION="${VERSION:-1.0.0}"
 MIN_MACOS=14.0
 # make-icon.swift is a separate build-time tool with its own entry point
-SOURCES=(main.swift Core.swift)
+SOURCES=(main.swift Core.swift CLI.swift CLIHelp.swift)
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
