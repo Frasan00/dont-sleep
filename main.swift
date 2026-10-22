@@ -32,6 +32,24 @@ func setSleepDisabled(_ on: Bool) -> Bool {
     run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "disablesleep", on ? "1" : "0"])
 }
 
+func sudoRuleWorks() -> Bool {
+    run("/usr/bin/sudo", ["-n", "-l", "/usr/bin/pmset", "-a", "disablesleep", "0"])
+}
+
+func asAppleScriptString(_ s: String) -> String {
+    s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+}
+
+// Runs entirely as root inside the root-only drop-in directory, so no user-writable file can be swapped between the visudo check and the move
+func sudoersInstallScript(dir: String = "/etc/sudoers.d") -> String {
+    let name = NSUserName()
+    let user = name.range(of: "^[A-Za-z0-9._-]+$", options: .regularExpression) != nil ? name : "#\(getuid())"
+    let rule = "\(user) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"
+    // sudo ignores files with a dot in the name, so a half-written staging file is never active
+    let t = "\(dir)/.dont-sleep.tmp"
+    return "PATH=/usr/bin:/bin:/usr/sbin:/sbin; umask 077; t=\(t); printf \"%s\\n\" \"\(rule)\" > \"$t\" && /usr/sbin/visudo -cf \"$t\" && /usr/sbin/chown root:wheel \"$t\" && /bin/chmod 440 \"$t\" && /bin/mv -f \"$t\" \(dir)/dont-sleep || { /bin/rm -f \"$t\"; exit 1; }"
+}
+
 func powerInfo() -> (onBattery: Bool, percent: Int)? {
     let info = IOPSCopyPowerSourcesInfo().takeRetainedValue()
     let sources = IOPSCopyPowerSourcesList(info).takeRetainedValue() as [CFTypeRef]
@@ -257,7 +275,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
 
     // Runs a command as root through the standard macOS admin prompt; completion gets nil when the user dismissed the prompt
     func runAsAdmin(_ rootCommand: String, completion: @escaping (Bool?) -> Void) {
-        let escaped = rootCommand.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let escaped = asAppleScriptString(rootCommand)
         let p = Process()
         let err = Pipe()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
@@ -275,9 +293,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
 
     // retry runs automatically once the sudoers rule is in place, so the user's original action is not lost
     func showSetupAlert(retry: @escaping () -> Void, nativeFailed: Bool = false) {
-        let rule = "\(NSUserName()) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"
-        let install = "f=$(mktemp) && echo '\(rule)' > \"$f\" && /usr/sbin/visudo -cf \"$f\" && /usr/bin/install -m 440 -o root -g wheel \"$f\" /etc/sudoers.d/dont-sleep && rm \"$f\""
-        let cmd = "f=$(mktemp) && echo '\(rule)' > \"$f\" && sudo visudo -cf \"$f\" && sudo install -m 440 -o root -g wheel \"$f\" /etc/sudoers.d/dont-sleep && rm \"$f\""
+        let install = sudoersInstallScript()
+        let cmd = "/usr/bin/sudo /bin/sh -c '\(install)'"
 
         let alert = NSAlert()
         alert.messageText = "One-time setup needed"
@@ -287,28 +304,40 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             actions.append(action)
         }
         let openTerminal = { [self] in
-            let url = FileManager.default.temporaryDirectory.appendingPathComponent("Dont Sleep Setup.command")
+            // A fresh private directory with an unpredictable name: nothing can be planted at the path beforehand
             let script = """
             #!/bin/bash
+            export PATH=/usr/bin:/bin:/usr/sbin:/sbin
             clear
             echo 'Dont Sleep one-time setup: macOS will ask for your password.'
             if \(cmd); then
               echo; echo 'Done.'
-              rm -- "$0"
-              TTY=$(tty)
+              /bin/rm -- "$0"; /bin/rmdir "$(/usr/bin/dirname "$0")" 2>/dev/null
+              TTY=$(/usr/bin/tty)
               # Detached so the window can be closed without a "terminate processes" prompt; Terminal quits if nothing else is open
-              ( sleep 1; osascript -e 'tell application "Terminal"' -e "close (every window whose tty is \\"$TTY\\")" -e 'delay 0.5' -e 'if (count of windows) is 0 then quit' -e 'end tell' ) >/dev/null 2>&1 </dev/null &
+              ( /bin/sleep 1; /usr/bin/osascript -e 'tell application "Terminal"' -e "close (every window whose tty is \\"$TTY\\")" -e 'delay 0.5' -e 'if (count of windows) is 0 then quit' -e 'end tell' ) >/dev/null 2>&1 </dev/null &
               disown
               exit 0
             else
               echo 'Setup failed.'
-              rm -- "$0"
+              /bin/rm -- "$0"; /bin/rmdir "$(/usr/bin/dirname "$0")" 2>/dev/null
             fi
             """
-            try? script.write(to: url, atomically: true, encoding: .utf8)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
-            NSWorkspace.shared.open(url)
-            waitForSudoRule(retry)
+            do {
+                let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+                let url = dir.appendingPathComponent("Dont Sleep Setup.command")
+                try script.write(to: url, atomically: false, encoding: .utf8)
+                try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+                NSWorkspace.shared.open(url)
+                waitForSudoRule(retry)
+            } catch {
+                let a = NSAlert()
+                a.messageText = "Could not prepare the setup script"
+                a.informativeText = "\(error.localizedDescription)\n\nUse Copy Command instead and paste it in Terminal."
+                NSApp.activate(ignoringOtherApps: true)
+                a.runModal()
+            }
         }
 
         if nativeFailed {
@@ -323,7 +352,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             button("Install") { [self] in
                 runAsAdmin(install) { result in
                     switch result {
-                    case true?: retry()
+                    case true?:
+                        // A silent mismatch (rule installed but not effective) must not look like success
+                        if sudoRuleWorks() { retry() } else { self.showSetupAlert(retry: retry, nativeFailed: true) }
                     case false?: self.showSetupAlert(retry: retry, nativeFailed: true)
                     case nil: break
                     }
