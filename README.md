@@ -17,10 +17,14 @@ a newer version (you can turn it off); nothing about you or your Mac is sent, an
 2. Open the DMG and drag **DontSleep** onto the **Applications** shortcut.
 3. Open **DontSleep** from Applications.
    The app is signed only with an ad-hoc signature (no paid Apple Developer ID), so macOS blocks the first launch with
-   a warning. Do one of these once:
-   - right-click the app, choose **Open**, then **Open** again; or
-   - open **System Settings → Privacy & Security** and click **Open Anyway**; or
-   - run `xattr -dr com.apple.quarantine /Applications/DontSleep.app` in Terminal.
+   **"DontSleep" Not Opened - Apple could not verify "DontSleep" is free of malware**. Do not click *Move to Trash*; click
+   **Done**, then allow it once with one of these:
+   - **System Settings → Privacy & Security**, scroll to the **Security** section, click **Open Anyway** next to
+     "DontSleep was blocked", then confirm with your password or Touch ID. This works on every macOS version; or
+   - run `xattr -dr com.apple.quarantine /Applications/DontSleep.app` in Terminal, then open the app normally; or
+   - on macOS 14 only, right-click the app and choose **Open**. (macOS 15 and later no longer allow this shortcut.)
+
+   Make sure the app is in **Applications** first: opening it straight from the DMG or the Downloads folder keeps it blocked.
 4. A cup or moon icon appears in the menu bar, and the Settings window opens once to show you where the app lives.
 
 ### Option 2: build from source
@@ -153,8 +157,8 @@ use `./build-dmg.sh v1.2.0` and attach `dist/*.dmg` to a release yourself.
 
 ## Notes
 
-- The app is not notarized: that needs a paid Apple Developer account, so the first launch needs the steps in
-  [Install](#option-1-download-the-release-recommended).
+- The app is not notarized: that needs a paid Apple Developer account, so the first launch needs the one-time
+  approval described in [Install](#option-1-download-the-release-recommended).
 - The update check is the only thing that uses the network. Disable it with **Settings → Updates**, or
   `dont-sleep config set check-updates off`.
 - Sleep prevention is a single system setting: the menu bar app and the `dont-sleep` command act on the same one.
