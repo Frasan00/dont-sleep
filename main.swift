@@ -762,9 +762,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         schedule(until: Date().addingTimeInterval(TimeInterval(seconds)))
     }
 
-    // Turns sleep prevention on if needed; extending adds to the running countdown instead of restarting it
+    // Turns sleep prevention on if needed; extending adds to the running countdown instead of restarting it, and does nothing when sleep prevention is off
     func keepAwake(seconds: Int, extend: Bool) {
         refresh()
+        if extend && !toggle.isOn { return }
         if !toggle.isOn {
             guard setSleepDisabled(true) else { return reportChangeFailure { self.keepAwake(seconds: seconds, extend: extend) } }
             refresh()
