@@ -939,7 +939,14 @@ struct SettingsView: View {
         }
     }
 
-    private var desiredHeight: CGFloat { (custom ? 110 : 0) + 200 + (lowBatteryOff ? 44 : 0) + (loginNote != nil ? 56 : 0) + (notifyAutoOff && notificationsDenied ? 56 : 0) + 630 }
+    private var desiredHeight: CGFloat {
+        var h: CGFloat = 830
+        if custom { h += 110 }
+        if lowBatteryOff { h += 44 }
+        if loginNote != nil { h += 56 }
+        if notifyAutoOff && notificationsDenied { h += 56 }
+        return h
+    }
 
     private func refreshNotificationStatus() {
         UNUserNotificationCenter.current().getNotificationSettings { st in
